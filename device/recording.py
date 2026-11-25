@@ -24,6 +24,7 @@ class DeviceRecording:
 
     def initialize(self, readings: dict[str, object] | None = None,
                    seed: tuple[int, object] | None = None) -> None:
+
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,6 +41,7 @@ class DeviceRecording:
                 bottle_id TEXT NOT NULL REFERENCES readings(bottle_id),
                 state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'cancelled')),
                 completion_number INTEGER UNIQUE,
+                requires_clean INTEGER NOT NULL DEFAULT 0 CHECK (requires_clean IN (0, 1)),
                 UNIQUE(session_id, command_id),
                 CHECK ((state = 'completed') = (completion_number IS NOT NULL))
             );
@@ -60,6 +62,14 @@ class DeviceRecording:
                 FOREIGN KEY (session_id, command_id) REFERENCES commands(session_id, command_id)
             );
         ''')
+        command_columns = {row[1] for row in self.db.execute('PRAGMA table_info(commands)')}
+        if 'requires_clean' not in command_columns:
+            self.db.execute('''
+                ALTER TABLE commands ADD COLUMN requires_clean INTEGER NOT NULL DEFAULT 0
+                    CHECK (requires_clean IN (0, 1))
+            ''')
+        from device import flow
+        flow.initialize_flow_tables(self.db)
         if seed is None:
             start, raw_json = 0, None
         else:
@@ -80,6 +90,12 @@ class DeviceRecording:
                                          (bottle_id,)).fetchone()
                 if original != encoded:
                     raise ValueError(f'recorded bottle {bottle_id!r} already has a reading')
+
+    def initialize_flow(self, initial_clean: bool, doses: int) -> None:
+        from device import flow
+
+        with self.transaction() as db:
+            flow.configure_flow(db, initial_clean, doses)
 
     @contextmanager
     def transaction(self):

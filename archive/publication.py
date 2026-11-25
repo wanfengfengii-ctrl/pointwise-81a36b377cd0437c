@@ -32,6 +32,12 @@ class PublishedSample:
         return cls(order_id, batch_id, bottle_id, number, int(raw_code), measured, receipt)
 
 
+@dataclass(frozen=True)
+class SensitivePublished:
+    sample: PublishedSample
+    basis: tuple[str, int | None]
+
+
 def publish_sample(store: ArchiveStore, evidence: VerifiedRawSample,
                    measured: MeasuredValue) -> PublishedSample:
     order_id = evidence.job.order_id
@@ -43,3 +49,22 @@ def publish_sample(store: ArchiveStore, evidence: VerifiedRawSample,
     except sqlite3.Error as error:
         raise CommitRejected(str(error)) from error
     return PublishedSample.from_row(row)
+
+
+def publish_sensitive_sample(store: ArchiveStore, evidence: VerifiedRawSample,
+                             measured: MeasuredValue,
+                             basis: tuple[str, int | None]) -> SensitivePublished:
+    order_id = evidence.job.order_id
+    receipt = make_receipt(order_id, evidence.completion_number)
+    try:
+        row = store.commit_pair(order_id, evidence.completion_number, evidence.raw_code,
+                                measured.value.numerator, measured.value.denominator,
+                                measured.unit, receipt.encode(), basis=basis)
+    except sqlite3.Error as error:
+        raise CommitRejected(str(error)) from error
+    row = store.lookup_sensitive(order_id)
+    if row is None:
+        raise CommitRejected('sensitive sample and clearance basis could not be paired')
+    sample = PublishedSample.from_row(row[:9])
+    stored_basis = (row[9], None if row[10] is None else int(row[10]))
+    return SensitivePublished(sample, stored_basis)

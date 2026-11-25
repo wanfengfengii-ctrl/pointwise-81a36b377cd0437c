@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from archive.publication import PublishedSample
-from archive.retrieval import retrieve
+from archive.publication import PublishedSample, SensitivePublished
+from archive.retrieval import retrieve, retrieve_sensitive
 from archive.store import ArchiveStore
 from control.active import initialize_active
 from control.dispatch import advance
@@ -19,7 +19,7 @@ from device.recording import DeviceRecording
 from measurement.calibration import initialize_calibrations, install_calibration, load_calibration
 from measurement.conversion import MeasuredValue, convert_reading
 from measurement.profiles import CalibrationProfile, build_profile
-from orders.admission import submit_orders
+from orders.admission import submit_orders, submit_sensitive_order
 from orders.batches import BatchBinding, initialize_batches, load_batch, register_batch
 from orders.bottles import BottleJob
 from orders.queue import initialize_queue
@@ -43,6 +43,7 @@ class Workbench:
     @classmethod
     def open(cls, path: str | Path, *, device_path: str | Path | None = None,
              readings: dict[str, object] | None = None, seed: tuple[int, object] | None = None,
+             flow: tuple[bool, int] | list | None = None,
              automatic: bool = True) -> 'Workbench':
         db = sqlite3.connect(path)
         recording = None
@@ -55,11 +56,15 @@ class Workbench:
             ArchiveStore(db).initialize()
             install_calibration(db, DEFAULT_PROFILE)
             if device_path is None:
-                if readings is not None or seed is not None:
+                if readings is not None or seed is not None or flow is not None:
                     raise ValueError('a recording requires a device database')
                 return cls(db, None)
             recording = DeviceRecording(device_path)
             recording.initialize(readings, seed)
+            if flow is not None:
+                if not isinstance(flow, (tuple, list)) or len(flow) != 2:
+                    raise ValueError('flow must be (initial_clean, doses)')
+                recording.initialize_flow(flow[0], flow[1])
             return cls(db, DevicePort(recording, automatic))
         except BaseException:
             if recording is not None:
@@ -89,6 +94,11 @@ class Workbench:
         jobs = submit_orders(self.db, batch_id, items)
         return self.show_signed_replays(jobs)
 
+    def submit_sensitive(self, batch_id: str, order_id: str,
+                         bottle_id: str) -> OrderAdmission:
+        job = submit_sensitive_order(self.db, batch_id, order_id, bottle_id)
+        return OrderAdmission(job, self.retrieve(order_id))
+
     def show_signed_replays(self, jobs: list[BottleJob]) -> list[OrderAdmission]:
         return [OrderAdmission(job, self.retrieve(job.order_id)) for job in jobs]
 
@@ -105,6 +115,9 @@ class Workbench:
 
     def retrieve(self, order_id: str) -> PublishedSample | None:
         return retrieve(self.archive, order_id)
+
+    def retrieve_sensitive(self, order_id: str) -> SensitivePublished | None:
+        return retrieve_sensitive(self.archive, order_id)
 
     def recompute(self, order_id: str) -> MeasuredValue | None:
         sample = self.retrieve(order_id)

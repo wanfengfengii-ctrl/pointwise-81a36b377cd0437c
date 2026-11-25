@@ -1,5 +1,5 @@
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from orders.bottles import BottleJob
 
@@ -10,6 +10,8 @@ class ActiveCollection:
     session_id: int
     command_id: str
     completion_number: int | None = None
+    # Operational actual-start evidence; excluded from historical equality.
+    basis: tuple[str, int | None] | None = field(default=None, compare=False)
 
 
 def initialize_active(db: sqlite3.Connection) -> None:
@@ -19,24 +21,34 @@ def initialize_active(db: sqlite3.Connection) -> None:
             order_id TEXT NOT NULL REFERENCES jobs(order_id),
             session_id INTEGER NOT NULL,
             command_id TEXT NOT NULL,
-            completion_number INTEGER
+            completion_number INTEGER,
+            basis_kind TEXT CHECK (basis_kind IN ('initial', 'rinse')),
+            basis_rinse_id INTEGER
         );
         CREATE TABLE IF NOT EXISTS control_progress (
             batch_id TEXT PRIMARY KEY NOT NULL REFERENCES batches(batch_id),
             position INTEGER NOT NULL CHECK (position > 0)
         );
     ''')
+    columns = {row[1] for row in db.execute('PRAGMA table_info(active_collection)')}
+    if 'basis_kind' not in columns:
+        db.execute("ALTER TABLE active_collection ADD COLUMN basis_kind TEXT")
+    if 'basis_rinse_id' not in columns:
+        db.execute("ALTER TABLE active_collection ADD COLUMN basis_rinse_id INTEGER")
 
 
 def load_active(db: sqlite3.Connection) -> ActiveCollection | None:
     row = db.execute('''
-        SELECT j.order_id, j.batch_id, j.bottle_id, j.position,
-               a.session_id, a.command_id, a.completion_number
+        SELECT j.order_id, j.batch_id, j.bottle_id, j.position, j.kind,
+               a.session_id, a.command_id, a.completion_number,
+               a.basis_kind, a.basis_rinse_id
         FROM active_collection AS a JOIN jobs AS j USING (order_id) WHERE a.slot = 1
     ''').fetchone()
     if row is None:
         return None
-    return ActiveCollection(BottleJob(*row[:4]), *row[4:])
+    job = BottleJob(*row[:5])
+    basis = None if row[8] is None else (row[8], None if row[9] is None else int(row[9]))
+    return ActiveCollection(job, row[5], row[6], row[7], basis)
 
 
 def load_progress(db: sqlite3.Connection, batch_id: str) -> int:
@@ -52,8 +64,11 @@ def reserve_attempt(db: sqlite3.Connection, job: BottleJob, session_id: int, com
         if current != prior or job.position != load_progress(db, job.batch_id) + 1:
             return None
         if prior is None:
-            db.execute('INSERT INTO active_collection VALUES (1, ?, ?, ?, NULL)',
-                       (job.order_id, session_id, command_id))
+            db.execute('''
+                INSERT INTO active_collection
+                    (slot, order_id, session_id, command_id, completion_number)
+                VALUES (1, ?, ?, ?, NULL)
+            ''', (job.order_id, session_id, command_id))
         else:
             if prior.completion_number is not None or prior.job != job:
                 return None
@@ -63,7 +78,8 @@ def reserve_attempt(db: sqlite3.Connection, job: BottleJob, session_id: int, com
 
 
 def record_completion(db: sqlite3.Connection, attempt: ActiveCollection,
-                      number: int) -> ActiveCollection | None:
+                      number: int,
+                      basis: tuple[str, int | None] | None = None) -> ActiveCollection | None:
     with db:
         db.execute('BEGIN IMMEDIATE')
         current = load_active(db)
@@ -73,8 +89,18 @@ def record_completion(db: sqlite3.Connection, attempt: ActiveCollection,
             return None
         if current.completion_number not in (None, number):
             return None
-        db.execute('UPDATE active_collection SET completion_number = ? WHERE slot = 1', (number,))
-    return ActiveCollection(attempt.job, attempt.session_id, attempt.command_id, number)
+        if current.basis is not None and basis is not None and current.basis != basis:
+            return None
+        basis_to_store = current.basis or basis
+        basis_kind = None if basis_to_store is None else basis_to_store[0]
+        basis_rinse_id = None if basis_to_store is None else basis_to_store[1]
+        db.execute('''
+            UPDATE active_collection
+            SET completion_number = ?, basis_kind = ?, basis_rinse_id = ?
+            WHERE slot = 1
+        ''', (number, basis_kind, basis_rinse_id))
+    return ActiveCollection(attempt.job, attempt.session_id, attempt.command_id, number,
+                            basis_to_store)
 
 
 def confirm_delivery(db: sqlite3.Connection, attempt: ActiveCollection,

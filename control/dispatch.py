@@ -9,6 +9,16 @@ from orders.batches import load_batch
 from orders.bottles import BottleJob
 
 
+def _sensitive_basis(port: DevicePort, job: BottleJob,
+                     session_id: int, command_id: str):
+    if job.kind != 'sensitive':
+        return None
+    basis = port.command_basis(session_id, command_id)
+    if basis is None:
+        raise DeviceError('sensitive aspiration started without a recorded clearance basis')
+    return basis
+
+
 def issue_attempt(db: sqlite3.Connection, port: DevicePort | None, job: BottleJob,
                   prior: ActiveCollection | None = None) -> StepResult:
     if port is None:
@@ -22,14 +32,24 @@ def issue_attempt(db: sqlite3.Connection, port: DevicePort | None, job: BottleJo
     if attempt is None:
         port.seal(session_id)
         return StepResult('pending', job.order_id, detail='dispatch eligibility changed')
+    requires_clean = job.kind == 'sensitive'
     try:
-        outcome = port.submit(session_id, command_id, job.bottle_id)
+        outcome = port.submit(session_id, command_id, job.bottle_id,
+                              requires_clean=requires_clean)
         if outcome is None:
+            if requires_clean:
+                clearance = port.clearance()
+                if clearance == 'rinse_unavailable':
+                    return StepResult('rinse_unavailable', job.order_id)
+                if clearance == 'flow_disabled':
+                    return StepResult('source_read_failed', job.order_id,
+                                     detail='shared flow clearance is not initialized')
             return StepResult('pending', job.order_id)
         port.seal(session_id)
+        basis = _sensitive_basis(port, job, session_id, command_id)
     except (DeviceError, sqlite3.Error) as error:
         return StepResult('source_read_failed', job.order_id, detail=str(error))
-    completion = bind_completion(db, attempt, outcome)
+    completion = bind_completion(db, attempt, outcome, basis)
     if completion is None:
         return StepResult('pending', job.order_id, detail='completion could not be bound')
     return deliver_head(db, port, completion)

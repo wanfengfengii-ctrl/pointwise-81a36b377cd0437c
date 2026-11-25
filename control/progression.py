@@ -1,9 +1,14 @@
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from archive.evidence import EvidenceMismatch, verify_latest_sample
-from archive.publication import CommitRejected, PublishedSample, publish_sample
-from archive.retrieval import retrieve
+from archive.publication import (
+    CommitRejected,
+    PublishedSample,
+    publish_sample,
+    publish_sensitive_sample,
+)
+from archive.retrieval import retrieve, retrieve_sensitive
 from archive.store import ArchiveStore
 from control.active import ActiveCollection, confirm_delivery, load_progress
 from control.completion import CompletedAspiration
@@ -23,6 +28,9 @@ class StepResult:
     order_id: str | None = None
     sample: PublishedSample | None = None
     detail: str | None = None
+    # Convenience copy of the archived sensitive basis; excluded from the
+    # historical StepResult value equality.
+    basis: tuple[str, int | None] | None = field(default=None, compare=False)
 
 
 def current_head(db: sqlite3.Connection, batch_id: str) -> BottleJob | None:
@@ -44,7 +52,11 @@ def _confirm_published(db: sqlite3.Connection, attempt: ActiveCollection,
         return StepResult('checkpoint_failed', job.order_id, detail=str(error))
     if not confirmed:
         return StepResult('pending', job.order_id, detail='active attempt changed')
-    return StepResult('published', job.order_id, sample)
+    basis = None
+    if job.kind == 'sensitive':
+        stored = retrieve_sensitive(ArchiveStore(db), job.order_id)
+        basis = None if stored is None else stored.basis
+    return StepResult('published', job.order_id, sample, basis=basis)
 
 
 def reconcile_delivery(db: sqlite3.Connection, attempt: ActiveCollection) -> StepResult | None:
@@ -60,7 +72,11 @@ def last_delivery(db: sqlite3.Connection, batch_id: str) -> StepResult:
     sample = retrieve(ArchiveStore(db), job.order_id)
     if sample is None:
         raise sqlite3.IntegrityError('confirmed queue position has no archived sample')
-    return StepResult('published', job.order_id, sample)
+    basis = None
+    if job.kind == 'sensitive':
+        signed = retrieve_sensitive(ArchiveStore(db), job.order_id)
+        basis = None if signed is None else signed.basis
+    return StepResult('published', job.order_id, sample, basis=basis)
 
 
 def deliver_head(db: sqlite3.Connection, port: DevicePort | None,
@@ -86,8 +102,21 @@ def deliver_head(db: sqlite3.Connection, port: DevicePort | None,
         measured = convert_reading(profile, evidence.raw_code)
     except InvalidReading as error:
         return StepResult('invalid_reading', order_id, detail=str(error))
-    try:
-        published = publish_sample(ArchiveStore(db), evidence, measured)
-    except CommitRejected as error:
-        return StepResult('commit_failed', order_id, detail=str(error))
+    sensitive_basis = None
+    if completion.job.kind == 'sensitive':
+        sensitive_basis = completion.attempt.basis
+        if sensitive_basis is None:
+            return StepResult('source_read_failed', order_id,
+                              detail='sensitive sample has no actual-start clearance basis')
+        try:
+            signed = publish_sensitive_sample(ArchiveStore(db), evidence, measured,
+                                              sensitive_basis)
+            published = signed.sample
+        except CommitRejected as error:
+            return StepResult('commit_failed', order_id, detail=str(error))
+    else:
+        try:
+            published = publish_sample(ArchiveStore(db), evidence, measured)
+        except CommitRejected as error:
+            return StepResult('commit_failed', order_id, detail=str(error))
     return _confirm_published(db, attempt, published)

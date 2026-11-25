@@ -1,6 +1,7 @@
 import sqlite3
 from dataclasses import dataclass
 
+from device import flow
 from device.latch import DeviceSample, write_completion
 from device.recording import DeviceError, read_recorded_code, record_action
 
@@ -26,11 +27,13 @@ def command_outcome(db: sqlite3.Connection, session_id: int,
 
 
 def enqueue_command(db: sqlite3.Connection, session_id: int, command_id: str,
-                    bottle_id: str) -> AspirationOutcome:
+                    bottle_id: str,
+                    requires_clean: bool = False) -> AspirationOutcome:
     from device.sessions import accepts_commands
 
     if not isinstance(command_id, str) or not command_id.strip():
         raise ValueError('command ID must be nonblank text')
+    clean_flag = 1 if requires_clean else 0
     existing = command_outcome(db, session_id, command_id)
     if existing is not None:
         if existing.bottle_id != bottle_id:
@@ -40,8 +43,9 @@ def enqueue_command(db: sqlite3.Connection, session_id: int, command_id: str,
         raise DeviceError('session is no longer accepting commands')
     read_recorded_code(db, bottle_id)
     db.execute('''
-        INSERT INTO commands(session_id, command_id, bottle_id, state) VALUES (?, ?, ?, 'queued')
-    ''', (session_id, command_id, bottle_id))
+        INSERT INTO commands(session_id, command_id, bottle_id, state, requires_clean)
+        VALUES (?, ?, ?, 'queued', ?)
+    ''', (session_id, command_id, bottle_id, clean_flag))
     return AspirationOutcome(session_id, command_id, bottle_id, 'queued', None)
 
 
@@ -49,16 +53,24 @@ def start_command(db: sqlite3.Connection) -> AspirationOutcome | None:
     if db.execute("SELECT 1 FROM commands WHERE state = 'running'").fetchone() is not None:
         return None
     row = db.execute('''
-        SELECT c.session_id, c.command_id, c.bottle_id FROM commands AS c
+        SELECT c.session_id, c.command_id, c.bottle_id, c.requires_clean
+        FROM commands AS c
         JOIN sessions AS s USING (session_id)
         WHERE c.state = 'queued' AND s.mode IN ('open', 'seal')
         ORDER BY c.queue_id LIMIT 1
     ''').fetchone()
     if row is None:
         return None
-    session_id, command_id, bottle_id = row
-    db.execute("UPDATE commands SET state = 'running' WHERE session_id = ? AND command_id = ?",
+    session_id, command_id, bottle_id, requires_clean = row
+    basis = flow.begin_command_clearance(db, bool(requires_clean))
+    if requires_clean and basis is None:
+        # The shared path is dirty and has no usable rinse clearance.
+        return None
+    db.execute('UPDATE commands SET state = \'running\' WHERE session_id = ? AND command_id = ?',
                (session_id, command_id))
+    if requires_clean:
+        flow.record_command_basis(db, session_id, command_id, basis)  # type: ignore[arg-type]
+    flow.release_flow(db, bottle_id=bottle_id)
     record_action(db, session_id, command_id, bottle_id)
     return AspirationOutcome(session_id, command_id, bottle_id, 'running', None)
 
@@ -81,8 +93,15 @@ def finish_command(db: sqlite3.Connection) -> tuple[AspirationOutcome, DeviceSam
 
 
 def cancel_queued_commands(db: sqlite3.Connection, session_id: int) -> None:
+    rows = db.execute('''
+        SELECT command_id, bottle_id FROM commands
+        WHERE session_id = ? AND state = 'queued'
+    ''', (session_id,)).fetchall()
     db.execute("UPDATE commands SET state = 'cancelled' WHERE session_id = ? AND state = 'queued'",
                (session_id,))
+    for command_id, bottle_id in rows:
+        flow.release_flow(db, bottle_id=bottle_id)
+        flow.release_flow(db, session_id=session_id, command_id=command_id)
 
 
 def session_outcomes(db: sqlite3.Connection, session_id: int) -> tuple[AspirationOutcome, ...]:

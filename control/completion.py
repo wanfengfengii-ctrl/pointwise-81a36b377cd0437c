@@ -26,12 +26,13 @@ class CompletedAspiration:
 
 
 def bind_completion(db: sqlite3.Connection, attempt: ActiveCollection,
-                    outcome: AspirationOutcome) -> CompletedAspiration | None:
+                    outcome: AspirationOutcome,
+                    basis: tuple[str, int | None] | None = None) -> CompletedAspiration | None:
     if outcome.state != 'completed' or outcome.completion_number is None:
         return None
     if (outcome.session_id, outcome.command_id, outcome.bottle_id) != (
         attempt.session_id, attempt.command_id, attempt.job.bottle_id
     ):
         return None
-    recorded = record_completion(db, attempt, outcome.completion_number)
+    recorded = record_completion(db, attempt, outcome.completion_number, basis)
     return None if recorded is None else CompletedAspiration(recorded)

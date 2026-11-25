@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -7,6 +7,8 @@ class BottleJob:
     batch_id: str
     bottle_id: str
     position: int
+    # Internal registration mode, excluded from the historical job identity.
+    kind: str = field(default='ordinary', compare=False)
 
 
 def validate_identifier(value: object, name: str) -> str:
